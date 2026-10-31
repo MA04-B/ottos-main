@@ -1,0 +1,17 @@
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+*.pyc
+*.db
+*.db-shm
+*.db-wal
+data/raw/
+data/exports/
+data/settings.json
+models/trained/
+logs/
+.conda/
+envs/
+.environment.sha256
+*.tmp
+.env

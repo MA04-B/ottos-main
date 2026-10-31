@@ -1,0 +1,18 @@
+name: otoslotto-ai
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - numpy>=1.26,<3
+  - pandas>=2.2,<3
+  - scipy>=1.12,<2
+  - scikit-learn>=1.5,<2
+  - streamlit>=1.50,<2
+  - plotly>=5.24,<7
+  - requests>=2.32,<3
+  - beautifulsoup4>=4.12,<5
+  - lxml>=5,<7
+  - joblib>=1.4,<2
+  - pytest>=8,<10
+  - pyyaml>=6,<7
+  - ruff>=0.9
