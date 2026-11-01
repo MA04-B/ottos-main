@@ -274,13 +274,30 @@ def prediction_center():
     seed = st.number_input("Random seed", 0, 2**31 - 1, int(preferences["seed"]))
     st.caption("Ranking scores are not winning probabilities. Ensemble uses independent statistical "
                "heuristics unless trained model outputs are available. Diversity only reduces portfolio overlap.")
-    generate, regenerate = st.columns(2)
-    first = generate.button("Generate 10 combinations", type="primary")
-    again = regenerate.button("Generate again")
-    if first or again:
-        effective_seed = int(seed) + (st.session_state.get("regeneration", 0) + 1 if again else 0)
-        if again:
-            st.session_state.regeneration = st.session_state.get("regeneration", 0) + 1
+    predictions = st.session_state.get("predictions", [])
+    if not predictions:
+        saved = db.latest_predictions()
+        if not saved.empty:
+            latest_batch = saved.iloc[0].batch_id
+            latest_rows = saved[saved.batch_id == latest_batch].sort_values("combination_number")
+            try:
+                predictions = [json.loads(value) for value in latest_rows.metadata]
+                st.session_state.predictions_backtest = predictions[0].get("backtesting")
+                predictions = [{k: v for k, v in p.items() if k != "backtesting"} for p in predictions]
+                st.session_state.predictions = predictions
+                st.session_state.batch = latest_batch
+                st.caption("Showing the latest saved portfolio")
+            except (ValueError, TypeError) as exc:
+                st.error(f"Saved predictions cannot be decoded: {exc}")
+    st.button("Generate 10 combinations", type="primary", use_container_width=True,
+              key="generate_initial", on_click=_queue_prediction_generation)
+    if st.session_state.pop("prediction_generation_pending", False):
+        if "prediction_generation_count" not in st.session_state:
+            previous_seed = predictions[0]["seed"] if predictions else None
+            st.session_state.prediction_generation_count = (
+                max(0, int(previous_seed) - int(seed) + 1) if previous_seed is not None else 0)
+        generation_count = st.session_state.prediction_generation_count
+        effective_seed = int(seed) + generation_count
         valid_model = current is not None and not current.get("stale", False)
         scores = current["scores"] if valid_model else np.full(90, 5 / 90)
         model_name = current["selected_model"] if valid_model else "uniform"
@@ -297,30 +314,19 @@ def prediction_center():
         try:
             ensemble_sources = ({name: values for name, values in current.get("model_scores", {}).items()
                                  if name not in ("uniform", "random")} if valid_model else None)
-            predictions = generate_combinations(
-                frame, scores=scores, seed=effective_seed, diversity=diversity,
-                strategy=strategy, model_name=model_name, ensemble_scores=ensemble_sources)
-            batch = str(uuid.uuid4())
-            db.save_predictions(predictions, batch, backtest=current.get("results") if current else None)
+            with st.spinner("Generating 10 combinations..."):
+                predictions = generate_combinations(
+                    frame, scores=scores, seed=effective_seed, diversity=diversity,
+                    strategy=strategy, model_name=model_name, ensemble_scores=ensemble_sources)
+                batch = str(uuid.uuid4())
+                db.save_predictions(predictions, batch, backtest=current.get("results") if current else None)
             st.session_state.predictions = predictions
             st.session_state.batch = batch
             st.session_state.predictions_backtest = current.get("results") if current else None
+            st.session_state.prediction_generation_count = generation_count + 1
         except (ValueError, RuntimeError, sqlite3.Error) as exc:
             st.error(f"Generation failed: {exc}")
     predictions = st.session_state.get("predictions", [])
-    saved = db.latest_predictions()
-    if not predictions and not saved.empty:
-        latest_batch = saved.iloc[0].batch_id
-        latest_rows = saved[saved.batch_id == latest_batch].sort_values("combination_number")
-        try:
-            predictions = [json.loads(value) for value in latest_rows.metadata]
-            st.session_state.predictions_backtest = predictions[0].get("backtesting")
-            predictions = [{k: v for k, v in p.items() if k != "backtesting"} for p in predictions]
-            st.session_state.predictions = predictions
-            st.session_state.batch = latest_batch
-            st.caption("Showing the latest saved portfolio")
-        except (ValueError, TypeError) as exc:
-            st.error(f"Saved predictions cannot be decoded: {exc}")
     if not predictions:
         st.info("Generate a reproducible portfolio. Every generated batch is saved automatically.")
         return
@@ -345,6 +351,8 @@ def prediction_center():
         except (ValueError, sqlite3.Error) as exc:
             st.error(f"Could not save predictions: {exc}")
     download(combinations_frame(predictions), "candidate_combinations.csv")
+    st.button("Generate Again", use_container_width=True, key="generate_again",
+              on_click=_queue_prediction_generation)
     if st.checkbox("Compare with historical results (descriptive, not a backtest)"):
         rows = frame[NUMBER_COLUMNS].to_numpy()
         comparison = []
@@ -481,6 +489,11 @@ def settings_page():
                 st.rerun()
             except (OSError, ValueError) as exc:
                 st.error(f"Could not save settings: {exc}")
+
+
+def _queue_prediction_generation():
+    if not st.session_state.get("prediction_generation_pending", False):
+        st.session_state["prediction_generation_pending"] = True
 
 
 navigation = st.navigation([
