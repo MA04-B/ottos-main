@@ -20,6 +20,7 @@ from src.jobs import TrainingJob
 from src.ml import available_models
 from src.ml.training import load_latest
 from src.prediction.generator import combinations_frame, generate_combinations
+from src.prediction.search import ACTIVE_STATUSES, MAX_SEARCH_ATTEMPTS, MagicSearchJob
 from src.preferences import read_preferences, save_preferences
 
 st.set_page_config(page_title="ÖTÖSLOTTO AI", page_icon="🎱", layout="wide")
@@ -263,15 +264,123 @@ def laboratory():
     st.dataframe(db.table("model_experiments"), hide_index=True, width="stretch")
 
 
+def _prediction_options(current, strategy, diversity):
+    valid_model = current is not None and not current.get("stale", False)
+    scores = current["scores"] if valid_model else np.full(90, 5 / 90)
+    model_name = current["selected_model"] if valid_model else "uniform"
+    override = preferences["selected_model"]
+    if override != "automatic":
+        if valid_model and override in current.get("model_scores", {}):
+            scores, model_name = current["model_scores"][override], override
+            st.warning("Manual model selection is exploratory; it does not establish predictive improvement.")
+        elif override == "uniform":
+            scores, model_name = np.full(90, 5 / 90), "uniform"
+        else:
+            raise ValueError("The selected model has no loaded artifact. Train/select automatic or uniform.")
+    ensemble_sources = ({name: values for name, values in current.get("model_scores", {}).items()
+                         if name not in ("uniform", "random")} if valid_model else None)
+    return dict(scores=scores, diversity=diversity, strategy=strategy,
+                model_name=model_name, ensemble_scores=ensemble_sources)
+
+
+def _next_generation_seed(predictions, seed):
+    if "prediction_generation_count" not in st.session_state:
+        previous_seed = predictions[0]["seed"] if predictions else None
+        st.session_state.prediction_generation_count = (
+            max(0, int(previous_seed) - int(seed) + 1) if previous_seed is not None else 0)
+    return int(seed) + st.session_state.prediction_generation_count
+
+
+def _show_historical_draws(draws):
+    for draw in draws:
+        draw_date = draw["draw_date"] or "Date omitted by official source"
+        st.write(f"Historical draw: {draw_date} · {draw['year']} / week {draw['week']}")
+        st.write("Historical winning numbers:", draw["numbers"])
+
+
+def _consume_magic_result(job):
+    snapshot = job.snapshot()
+    if (not snapshot.search_id or snapshot.status in ACTIVE_STATUSES
+            or st.session_state.get("magic_processed_id") == snapshot.search_id):
+        return
+    st.session_state.magic_processed_id = snapshot.search_id
+    if snapshot.last_seed is not None:
+        st.session_state.prediction_generation_count = snapshot.last_seed - st.session_state.magic_base_seed + 1
+    if snapshot.status != "matched":
+        return
+    predictions = list(snapshot.portfolio)
+    predictions[snapshot.matched_index]["historical_search"] = {
+        "attempts": snapshot.attempts,
+        "checked_combinations": snapshot.checked_combinations,
+        "historical_draws": list(snapshot.historical_draws),
+    }
+    st.session_state.predictions = predictions
+    st.session_state.batch = snapshot.search_id
+    st.session_state.predictions_backtest = st.session_state.get("magic_backtest")
+    try:
+        db.save_predictions(predictions, snapshot.search_id, backtest=st.session_state.predictions_backtest)
+    except (ValueError, sqlite3.Error) as exc:
+        st.session_state.magic_save_error = f"Historical match found, but saving the portfolio failed: {exc}"
+        logging.getLogger(__name__).exception("Could not save Magic Generate portfolio")
+
+
+@st.fragment(run_every=1)
+def magic_search_status():
+    job = st.session_state.get("magic_search_job")
+    if job is None:
+        return
+    snapshot = job.snapshot()
+    if not snapshot.search_id:
+        return
+    if (snapshot.status not in ACTIVE_STATUSES
+            and st.session_state.get("magic_processed_id") != snapshot.search_id):
+        st.rerun()
+    if st.session_state.get("magic_display_id") != snapshot.search_id:
+        return
+    st.progress(snapshot.attempts / snapshot.max_attempts,
+                text=f"Attempts: {snapshot.attempts:,} / {snapshot.max_attempts:,} · "
+                     f"Combinations checked: {snapshot.checked_combinations:,}")
+    st.caption(f"Elapsed: {snapshot.elapsed_seconds:.1f}s · One attempt generates a portfolio of ten combinations.")
+    if snapshot.status in ACTIVE_STATUSES:
+        st.info("Searching historical results in a background worker. This is not a future-draw prediction.")
+        if st.button("Stop search", key="magic_stop", disabled=snapshot.status == "cancelling"):
+            job.stop()
+            st.rerun()
+        if snapshot.status == "cancelling":
+            st.caption("Stopping after the current generator call finishes...")
+    elif snapshot.status == "matched":
+        st.success(f"Exact 5/5 historical match found after {snapshot.attempts:,} attempts "
+                   f"({snapshot.checked_combinations:,} combinations checked).")
+        st.markdown(balls(snapshot.portfolio[snapshot.matched_index]["numbers"]), unsafe_allow_html=True)
+        _show_historical_draws(snapshot.historical_draws)
+        st.warning("This is a deliberately searched in-sample historical match, not a prediction, "
+                   "a backtest, or evidence of better future winning odds.")
+        if st.session_state.get("magic_save_error"):
+            st.error(st.session_state.magic_save_error)
+    elif snapshot.status == "exhausted":
+        st.warning("No exact 5/5 historical match was found within the attempt limit. "
+                   "Your previously displayed portfolio has not been changed.")
+    elif snapshot.status == "cancelled":
+        st.info("Search stopped. Your previously displayed portfolio has not been changed.")
+    elif snapshot.status == "failed":
+        st.error(f"Magic Generate failed: {snapshot.error}. Details are recorded in the application log.")
+
+
 def prediction_center():
     st.title("Prediction Center")
     require_data()
     current = artifact()
+    if "magic_search_job" not in st.session_state:
+        st.session_state.magic_search_job = MagicSearchJob()
+    job = st.session_state.magic_search_job
+    _consume_magic_result(job)
+    searching = job.snapshot().status in ACTIVE_STATUSES
     strategies = ["mixed", "ranked", "weighted", "historical", "recent", "bayesian",
                   "balanced", "ensemble", "diversified"]
-    strategy = st.selectbox("Generation strategy", strategies, index=strategies.index(preferences["strategy"]))
-    diversity = st.slider("Portfolio diversity", 0., 1., float(preferences["diversity"]))
-    seed = st.number_input("Random seed", 0, 2**31 - 1, int(preferences["seed"]))
+    strategy = st.selectbox("Generation strategy", strategies, index=strategies.index(preferences["strategy"]),
+                            disabled=searching)
+    diversity = st.slider("Portfolio diversity", 0., 1., float(preferences["diversity"]), disabled=searching)
+    seed = st.number_input("Random seed", 0, 2**31 - 1, int(preferences["seed"]), disabled=searching)
     st.caption("Ranking scores are not winning probabilities. Ensemble uses independent statistical "
                "heuristics unless trained model outputs are available. Diversity only reduces portfolio overlap.")
     predictions = st.session_state.get("predictions", [])
@@ -290,52 +399,44 @@ def prediction_center():
             except (ValueError, TypeError) as exc:
                 st.error(f"Saved predictions cannot be decoded: {exc}")
     st.button("Generate 10 combinations", type="primary", use_container_width=True,
-              key="generate_initial", on_click=_queue_prediction_generation)
-    if st.session_state.pop("prediction_generation_pending", False):
-        if "prediction_generation_count" not in st.session_state:
-            previous_seed = predictions[0]["seed"] if predictions else None
-            st.session_state.prediction_generation_count = (
-                max(0, int(previous_seed) - int(seed) + 1) if previous_seed is not None else 0)
-        generation_count = st.session_state.prediction_generation_count
-        effective_seed = int(seed) + generation_count
-        valid_model = current is not None and not current.get("stale", False)
-        scores = current["scores"] if valid_model else np.full(90, 5 / 90)
-        model_name = current["selected_model"] if valid_model else "uniform"
-        override = preferences["selected_model"]
-        if override != "automatic":
-            if valid_model and override in current.get("model_scores", {}):
-                scores, model_name = current["model_scores"][override], override
-                st.warning("Manual model selection is exploratory; it does not establish predictive improvement.")
-            elif override == "uniform":
-                scores, model_name = np.full(90, 5 / 90), "uniform"
-            else:
-                st.error("The selected model has no loaded artifact. Train/select automatic or uniform.")
-                st.stop()
+              key="generate_initial", on_click=_queue_prediction_generation, disabled=searching)
+    pending_generate = st.session_state.pop("prediction_generation_pending", False)
+    pending_magic = st.session_state.pop("magic_generation_pending", False)
+    if (pending_generate or pending_magic) and not searching:
         try:
-            ensemble_sources = ({name: values for name, values in current.get("model_scores", {}).items()
-                                 if name not in ("uniform", "random")} if valid_model else None)
-            with st.spinner("Generating 10 combinations..."):
-                predictions = generate_combinations(
-                    frame, scores=scores, seed=effective_seed, diversity=diversity,
-                    strategy=strategy, model_name=model_name, ensemble_scores=ensemble_sources)
-                batch = str(uuid.uuid4())
-                db.save_predictions(predictions, batch, backtest=current.get("results") if current else None)
-            st.session_state.predictions = predictions
-            st.session_state.batch = batch
-            st.session_state.predictions_backtest = current.get("results") if current else None
-            st.session_state.prediction_generation_count = generation_count + 1
+            options = _prediction_options(current, strategy, diversity)
+            effective_seed = _next_generation_seed(predictions, seed)
+            options["seed"] = effective_seed
+            if pending_magic:
+                search_id = job.start(frame, options, max_attempts=st.session_state.get("magic_max_attempts", 1000))
+                st.session_state.magic_base_seed = int(seed)
+                st.session_state.magic_backtest = current.get("results") if current else None
+                st.session_state.magic_display_id = search_id
+                st.session_state.pop("magic_save_error", None)
+                st.rerun()
+            else:
+                with st.spinner("Generating 10 combinations..."):
+                    predictions = generate_combinations(frame, **options)
+                    batch = str(uuid.uuid4())
+                    db.save_predictions(predictions, batch, backtest=current.get("results") if current else None)
+                st.session_state.predictions = predictions
+                st.session_state.batch = batch
+                st.session_state.predictions_backtest = current.get("results") if current else None
+                st.session_state.prediction_generation_count += 1
+                st.session_state.magic_display_id = None
         except (ValueError, RuntimeError, sqlite3.Error) as exc:
             st.error(f"Generation failed: {exc}")
     predictions = st.session_state.get("predictions", [])
     if not predictions:
         st.info("Generate a reproducible portfolio. Every generated batch is saved automatically.")
-        return
     columns = st.columns(2)
     for i, prediction in enumerate(predictions):
         with columns[i % 2]:
             strategy_name = html.escape(prediction["strategy"])
             st.markdown(f'<div class="card"><div class="eyebrow">COMBINATION {i+1:02d} · {strategy_name}</div>'
                         f'{balls(prediction["numbers"])}</div>', unsafe_allow_html=True)
+            if prediction.get("historical_search"):
+                st.info("Magic Generate: exact 5/5 historical match (not a future prediction).")
             st.caption(f"Seed {prediction['seed']} · Sum {prediction['sum']} · Odd/even {prediction['odd']}/{5-prediction['odd']} · "
                        f"Spread {prediction['spread']} · Mean score {np.mean(prediction['scores']):.4f}")
             with st.expander(f"Explanation & number scores #{i+1}"):
@@ -343,17 +444,31 @@ def prediction_center():
                 st.dataframe(pd.DataFrame(prediction["number_details"]), hide_index=True)
                 st.write("Number bands:", [f"{((n-1)//10)*10+1}-{((n-1)//10)*10+10}"
                                           for n in prediction["numbers"]])
-    if st.button("Save predictions"):
+                if prediction.get("historical_search"):
+                    match = prediction["historical_search"]
+                    st.caption(f"Exact historical match found after {match['attempts']:,} search attempts.")
+                    _show_historical_draws(match["historical_draws"])
+    if predictions and st.button("Save predictions"):
         try:
             db.save_predictions(predictions, st.session_state.batch,
                                 backtest=st.session_state.get("predictions_backtest"))
             st.success("Saved (duplicate-safe)")
         except (ValueError, sqlite3.Error) as exc:
             st.error(f"Could not save predictions: {exc}")
-    download(combinations_frame(predictions), "candidate_combinations.csv")
-    st.button("Generate Again", use_container_width=True, key="generate_again",
-              on_click=_queue_prediction_generation)
-    if st.checkbox("Compare with historical results (descriptive, not a backtest)"):
+    if predictions:
+        download(combinations_frame(predictions), "candidate_combinations.csv")
+    again_column, magic_column = st.columns(2)
+    again_column.button("Generate Again", use_container_width=True, key="generate_again",
+                        on_click=_queue_prediction_generation, disabled=searching)
+    magic_column.button("Magic Generate", icon="🪄", type="primary", use_container_width=True,
+                        key="magic_generate", on_click=_queue_magic_generation, disabled=searching)
+    st.number_input("Maximum Magic Generate attempts", 1, MAX_SEARCH_ATTEMPTS, 1000,
+                    key="magic_max_attempts", disabled=searching,
+                    help="Each attempt uses the existing engine to generate ten tickets with a new seed.")
+    st.caption("Magic Generate searches for an exact repeat of a past drawing. It may take many attempts "
+               "or find no match; a historical repeat says nothing about future winning odds.")
+    magic_search_status()
+    if predictions and st.checkbox("Compare with historical results (descriptive, not a backtest)"):
         rows = frame[NUMBER_COLUMNS].to_numpy()
         comparison = []
         for i, prediction in enumerate(predictions, 1):
@@ -492,8 +607,18 @@ def settings_page():
 
 
 def _queue_prediction_generation():
+    job = st.session_state.get("magic_search_job")
+    if job is not None and job.snapshot().status in ACTIVE_STATUSES:
+        return
     if not st.session_state.get("prediction_generation_pending", False):
         st.session_state["prediction_generation_pending"] = True
+
+
+def _queue_magic_generation():
+    job = st.session_state.get("magic_search_job")
+    if job is not None and job.snapshot().status in ACTIVE_STATUSES:
+        return
+    st.session_state.magic_generation_pending = True
 
 
 navigation = st.navigation([

@@ -192,6 +192,28 @@ conda env update -n otoslotto-ai -f environment.yml --prune
    historical counts and combination characteristics. Generation saves the
    batch automatically; the separate Save button is idempotent.
    "Generate again" advances the displayed seed deterministically.
+   **🪄 Magic Generate**, next to Generate Again, runs a cancellable background
+   search using the same generator and current strategy/model settings. An
+   attempt generates ten tickets with a new seed; the default limit is 1,000
+   attempts and the configurable maximum is 10,000. Live progress shows attempts
+   and tickets checked. **Stop search** cancels after the current generator call
+   finishes. Other pages and CSV downloads remain usable.
+
+   An exact five-of-five historical repeat stops the search and displays the
+   matching ticket within its ten-ticket portfolio, the attempt count and the
+   official historical draw date/numbers. Undated official records show their
+   year/week without inventing dates. The successful portfolio is saved; failure,
+   cancellation or exhaustion preserves the previously displayed portfolio.
+   Conflicting generation buttons are disabled during a search. A search is
+   isolated to its browser session and remains bounded if you navigate away.
+
+   **This intentionally searches known history and is not a prediction,
+   backtest or guarantee of future wins.** Exact repeats can be rare, and some
+   constrained strategies may never reach any historical ticket. The limit
+   controls attempts, not wall-clock time: a large search can take minutes
+   because each call uses the existing engine, including its historical
+   analysis. Closing a browser does not immediately cancel its worker; use Stop
+   search first, or the worker will end at its limit.
 7. **Settings:** persist defaults, update interval and model preferences.
    Automatic selection or uniform always works; an explicitly chosen learned
    model needs an appropriate saved artifact.
